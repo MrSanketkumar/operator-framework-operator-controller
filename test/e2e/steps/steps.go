@@ -50,13 +50,15 @@ import (
 )
 
 const (
-	olmDeploymentName = "operator-controller-controller-manager"
-	timeout           = 5 * time.Minute
-	tick              = 1 * time.Second
+	olmDeploymentName      = "operator-controller-controller-manager"
+	catalogdDeploymentName = "catalogd-controller-manager"
+	timeout                = 5 * time.Minute
+	tick                   = 1 * time.Second
 )
 
 var (
 	olmNamespace        = "olmv1-system"
+	componentNamespaces = map[string]string{} // keyed by component label (e.g. "catalogd"); falls back to olmNamespace
 	kubeconfigPath      string
 	k8sCli              string
 	deployImageRegistry = sync.OnceValue(func() error {
@@ -99,6 +101,7 @@ func RegisterSteps(sc *godog.ScenarioContext) {
 	sc.Step(`^(?i)ClusterExtension is applied(?:\s+.*)?$`, ResourceIsApplied)
 	sc.Step(`^(?i)ClusterExtension is updated to version "([^"]+)"$`, ClusterExtensionVersionUpdate)
 	sc.Step(`^(?i)ClusterExtension is updated(?:\s+.*)?$`, ResourceIsApplied)
+	sc.Step(`^(?i)ClusterObjectSet "([^"]+)" lifecycle is set to "([^"]+)"$`, ClusterObjectSetLifecycleUpdate)
 	sc.Step(`^(?i)ClusterExtension is available$`, ClusterExtensionIsAvailable)
 	sc.Step(`^(?i)ClusterExtension is rolled out$`, ClusterExtensionIsRolledOut)
 	sc.Step(`^(?i)ClusterExtension resources are created and labeled$`, ClusterExtensionResourcesCreatedAndAreLabeled)
@@ -194,6 +197,9 @@ func RegisterSteps(sc *godog.ScenarioContext) {
 	sc.Step(`^(?i)the "([^"]+)" component is configured with HTTPS_PROXY "([^"]+)"$`, ConfigureDeploymentWithHTTPSProxy)
 	sc.Step(`^(?i)the "([^"]+)" component is configured with HTTPS_PROXY pointing to a recording proxy$`, StartRecordingProxyAndConfigureDeployment)
 	sc.Step(`^(?i)the recording proxy received a CONNECT request for the catalogd service$`, RecordingProxyReceivedCONNECTForCatalogd)
+
+	sc.Step(`^(?i)the catalogd leader pod is force-deleted$`, CatalogdLeaderPodIsForceDeleted)
+	sc.Step(`^(?i)a new catalogd leader is elected$`, NewCatalogdLeaderIsElected)
 }
 
 func init() {
@@ -208,6 +214,15 @@ func init() {
 		}
 		flagSet.StringVar(&kubeconfigPath, "kubeconfig", filepath.Join(home, ".kube", "config"), "Paths to a kubeconfig. Only required if out-of-cluster.")
 	}
+}
+
+// namespaceForComponent returns the namespace for the named OLM component.
+// Falls back to olmNamespace when the component has no dedicated entry (e.g. upstream single-namespace deployments).
+func namespaceForComponent(component string) string {
+	if ns, ok := componentNamespaces[component]; ok {
+		return ns
+	}
+	return olmNamespace
 }
 
 func k8sClient(args ...string) (string, error) {
@@ -371,6 +386,23 @@ func ClusterExtensionVersionUpdate(ctx context.Context, version string) error {
 		return err
 	}
 	_, err = k8sClient("patch", "clusterextension", sc.clusterExtensionName, "--type", "merge", "-p", string(pb))
+	return err
+}
+
+// ClusterObjectSetLifecycleUpdate patches the ClusterObjectSet's lifecycleState to the specified value.
+func ClusterObjectSetLifecycleUpdate(ctx context.Context, cosName, lifecycle string) error {
+	sc := scenarioCtx(ctx)
+	cosName = substituteScenarioVars(cosName, sc)
+	patch := map[string]any{
+		"spec": map[string]any{
+			"lifecycleState": lifecycle,
+		},
+	}
+	pb, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	_, err = k8sClient("patch", "clusterobjectset", cosName, "--type", "merge", "-p", string(pb))
 	return err
 }
 
@@ -1568,7 +1600,10 @@ func parseCatalogTable(table *godog.Table) ([]catalog.PackageOption, error) {
 				return nil, fmt.Errorf("duplicate bundle %s/%s: contents must be empty for repeated versions", pkg, version)
 			}
 		} else {
-			opts := parseContents(contents)
+			opts, err := parseContents(contents)
+			if err != nil {
+				return nil, fmt.Errorf("bundle %s/%s: %w", pkg, version, err)
+			}
 			bundleDefs[bk] = &bundleEntry{opts: opts}
 			bundleOrder = append(bundleOrder, bk)
 		}
@@ -1655,13 +1690,13 @@ spec:
 	return nil
 }
 
-func parseContents(contents string) []catalog.BundleOption {
+func parseContents(contents string) ([]catalog.BundleOption, error) {
 	contents = strings.TrimSpace(contents)
 	if contents == "" {
-		return nil
+		return nil, nil
 	}
 	if strings.EqualFold(contents, "BadImage") {
-		return []catalog.BundleOption{catalog.BadImage()}
+		return []catalog.BundleOption{catalog.BadImage()}, nil
 	}
 	var opts []catalog.BundleOption
 	for _, part := range strings.Split(contents, ",") {
@@ -1686,10 +1721,11 @@ func parseContents(contents string) []catalog.BundleOption {
 		case strings.HasPrefix(part, "LargeCRD(") && strings.HasSuffix(part, ")"):
 			// LargeCRD(250)
 			countStr := part[len("LargeCRD(") : len(part)-1]
-			count, err := strconv.Atoi(countStr)
-			if err == nil {
-				opts = append(opts, catalog.WithLargeCRD(count))
+			count, err := strconv.ParseInt(countStr, 10, 0)
+			if err != nil || count <= 0 {
+				return nil, fmt.Errorf("invalid LargeCRD field count %q: must be a positive integer", countStr)
 			}
+			opts = append(opts, catalog.WithLargeCRD(int(count)))
 		case strings.HasPrefix(part, "ClusterRegistry(") && strings.HasSuffix(part, ")"):
 			// ClusterRegistry(mirrored-registry.operator-controller-e2e.svc.cluster.local:5000)
 			host := part[len("ClusterRegistry(") : len(part)-1]
@@ -1701,7 +1737,7 @@ func parseContents(contents string) []catalog.BundleOption {
 			opts = append(opts, catalog.StaticBundleDir(absDir))
 		}
 	}
-	return opts
+	return opts, nil
 }
 
 // PrometheusMetricsAreReturned validates that each pod's stored metrics response is non-empty and parses as valid Prometheus text format.

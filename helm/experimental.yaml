@@ -7,6 +7,8 @@
 # to pull in resources or additions
 options:
   operatorController:
+    deployment:
+      replicas: 2
     features:
       enabled:
         - SingleOwnNamespaceInstallSupport
@@ -14,12 +16,15 @@ options:
         - HelmChartSupport
         - BoxcutterRuntime
         - DeploymentConfig
+        - BundleReleaseSupport
       disabled:
         - WebhookProviderOpenshiftServiceCA
 # List of enabled experimental features for catalogd
 # Use with {{- if has "FeatureGate" .Values.options.catalogd.features.enabled }}
 # to pull in resources or additions
   catalogd:
+    deployment:
+      replicas: 2
     features:
       enabled:
         - APIV1MetasHandler

@@ -8,11 +8,12 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
-	"sync"
+	"strings"
 
 	"github.com/cucumber/godog"
 	"github.com/go-logr/logr"
 	"github.com/spf13/pflag"
+	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/component-base/featuregate"
@@ -90,6 +91,7 @@ var (
 		features.HelmChartSupport:                  false,
 		features.BoxcutterRuntime:                  false,
 		features.DeploymentConfig:                  false,
+		catalogdHAFeature:                          false,
 	}
 	logger logr.Logger
 )
@@ -106,22 +108,33 @@ func RegisterHooks(sc *godog.ScenarioContext) {
 	sc.After(ScenarioCleanup)
 }
 
-func detectOLMDeployment() (*appsv1.Deployment, error) {
+// detectOLMDeployments returns the operator-controller deployment (first) and the catalogd
+// deployment (second) found via the app.kubernetes.io/part-of=olm label across all namespaces.
+// The catalogd return value may be nil when OLM is not yet installed (upgrade scenarios
+// install it in a Background step).
+func detectOLMDeployments() (*appsv1.Deployment, *appsv1.Deployment, error) {
 	raw, err := k8sClient("get", "deployments", "-A", "-l", "app.kubernetes.io/part-of=olm", "-o", "jsonpath={.items}")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	dl := []appsv1.Deployment{}
 	if err := json.Unmarshal([]byte(raw), &dl); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal OLM deployments: %v", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal OLM deployments: %v", err)
 	}
 
-	for _, d := range dl {
-		if d.Name == olmDeploymentName {
-			return &d, nil
+	var operatorController, catalogd *appsv1.Deployment
+	for i := range dl {
+		switch dl[i].Name {
+		case olmDeploymentName:
+			operatorController = &dl[i]
+		case catalogdDeploymentName:
+			catalogd = &dl[i]
 		}
 	}
-	return nil, fmt.Errorf("failed to detect OLM Deployment")
+	if operatorController == nil {
+		return nil, nil, fmt.Errorf("failed to detect OLM Deployment")
+	}
+	return operatorController, catalogd, nil
 }
 
 func BeforeSuite() {
@@ -131,12 +144,39 @@ func BeforeSuite() {
 		logger = textlogger.NewLogger(textlogger.NewConfig())
 	}
 
-	olm, err := detectOLMDeployment()
+	// Enable HA scenarios when the cluster has at least 2 nodes.  This runs
+	// unconditionally so that upgrade scenarios (which install OLM in a Background
+	// step and return early below) still get the gate set correctly.
+	if out, err := k8sClient("get", "nodes", "--no-headers", "-o", "name"); err == nil &&
+		len(strings.Fields(strings.TrimSpace(out))) >= 2 {
+		featureGates[catalogdHAFeature] = true
+	}
+
+	olm, catalogdDep, err := detectOLMDeployments()
 	if err != nil {
 		logger.Info("OLM deployments not found; skipping feature gate detection (upgrade scenarios will install OLM in Background)")
 		return
 	}
 	olmNamespace = olm.Namespace
+	componentNamespaces["operator-controller"] = olmNamespace
+
+	// Catalogd may be in a different namespace than operator-controller.
+	catalogdNS := olmNamespace
+	if catalogdDep != nil {
+		catalogdNS = catalogdDep.Namespace
+	}
+	componentNamespaces["catalogd"] = catalogdNS
+
+	// Refine CatalogdHA based on actual catalogd replica count now that catalogdNS is
+	// known.  The node-count check above can fire on any multi-node cluster even when
+	// catalogd runs with only 1 replica.  Override the gate: HA scenarios require ≥2
+	// catalogd replicas.  Fall back to whatever the node-count check set when catalogd
+	// was not found or the replica count is not parseable.
+	if catalogdDep != nil {
+		if replicas := catalogdDep.Spec.Replicas; replicas != nil {
+			featureGates[catalogdHAFeature] = *replicas >= 2
+		}
+	}
 
 	featureGatePattern := regexp.MustCompile(`--feature-gates=([[:alnum:]]+)=(true|false)`)
 	for _, c := range olm.Spec.Template.Spec.Containers {
@@ -152,6 +192,7 @@ func BeforeSuite() {
 			}
 		}
 	}
+
 	logger.Info(fmt.Sprintf("Enabled feature gates: %v", featureGates))
 }
 
@@ -233,20 +274,20 @@ func ScenarioCleanup(ctx context.Context, _ *godog.Scenario, err error) (context
 	}
 	forDeletion = append(forDeletion, resource{name: sc.namespace, kind: "namespace"})
 
-	var wg sync.WaitGroup
+	g := new(errgroup.Group)
+	g.SetLimit(8)
 	for _, r := range forDeletion {
-		wg.Add(1)
-		go func(res resource) {
-			defer wg.Done()
-			args := []string{"delete", res.kind, res.name, "--ignore-not-found=true"}
-			if res.namespace != "" {
-				args = append(args, "-n", res.namespace)
+		g.Go(func() error {
+			args := []string{"delete", r.kind, r.name, "--ignore-not-found=true"}
+			if r.namespace != "" {
+				args = append(args, "-n", r.namespace)
 			}
 			if _, err := k8sClient(args...); err != nil {
-				logger.Info("Error deleting resource", "name", res.name, "namespace", res.namespace, "stderr", stderrOutput(err))
+				logger.Info("Error deleting resource", "name", r.name, "namespace", r.namespace, "stderr", stderrOutput(err))
 			}
-		}(r)
+			return nil
+		})
 	}
-	wg.Wait()
+	_ = g.Wait()
 	return ctx, nil
 }
